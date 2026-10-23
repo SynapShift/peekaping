@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 20
     env:
       PEE_TEST_POSTGRES_TLS_DSN: postgres://peekaping:peekaping-test@localhost:15432/peekaping
+      PEE_TEST_POSTGRES_DSN: postgres://peekaping:peekaping-test@localhost:15432/peekaping?sslmode=disable
+      PEE_TEST_MONGO_URI: mongodb://127.0.0.1:27017
       BUNDEBUG: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -57,6 +59,18 @@ jobs:
           done
           test "$ssl" = on
           printf 'SSL_CERT_FILE=%s\n' "$RUNNER_TEMP/server.crt" >> "$GITHUB_ENV"
+      - name: Start MongoDB for the PostgreSQL import regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name peekaping-mongo-258 -p 127.0.0.1:27017:27017 mongo:7
+          for i in $(seq 1 60); do
+            if docker exec peekaping-mongo-258 mongosh --quiet --eval 'db.runCommand({ping:1})'; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec peekaping-mongo-258 mongosh --quiet --eval 'db.runCommand({ping:1})'
       - name: Confirm unchanged upstream fails the TLS regressions
         shell: bash
         run: |
@@ -115,6 +129,6 @@ jobs:
           path: |
             before.log
             after.jsonl
-      - name: Stop test database
+      - name: Stop test databases
         if: always()
-        run: docker rm -f peekaping-postgres-258
+        run: docker rm -f peekaping-postgres-258 peekaping-mongo-258

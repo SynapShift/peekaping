@@ -1,0 +1,120 @@
+name: Verify PostgreSQL SSL mode
+
+on:
+  push:
+    branches: [verify/postgres-sslmode]
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-tls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PEE_TEST_POSTGRES_TLS_DSN: postgres://peekaping:peekaping-test@localhost:15432/peekaping
+      BUNDEBUG: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 3
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: apps/server/go.sum
+      - name: Start PostgreSQL with a trusted test certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+            -addext 'basicConstraints=critical,CA:TRUE' \
+            -keyout "$RUNNER_TEMP/server.key" -out "$RUNNER_TEMP/server.crt"
+          docker run -d --name peekaping-postgres-258 \
+            -e POSTGRES_USER=peekaping -e POSTGRES_PASSWORD=peekaping-test \
+            -e POSTGRES_DB=peekaping -p 127.0.0.1:15432:5432 postgres:17
+          for i in $(seq 1 60); do
+            if docker exec peekaping-postgres-258 pg_isready -U peekaping -d peekaping; then
+              break
+            fi
+            sleep 1
+          done
+          docker cp "$RUNNER_TEMP/server.crt" peekaping-postgres-258:/tmp/server.crt
+          docker cp "$RUNNER_TEMP/server.key" peekaping-postgres-258:/tmp/server.key
+          docker exec -u root peekaping-postgres-258 chown postgres:postgres /tmp/server.crt /tmp/server.key
+          docker exec -u root peekaping-postgres-258 chmod 600 /tmp/server.key
+          docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -c "ALTER SYSTEM SET ssl_cert_file='/tmp/server.crt'"
+          docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -c "ALTER SYSTEM SET ssl_key_file='/tmp/server.key'"
+          docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -c "ALTER SYSTEM SET ssl='on'"
+          docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -c 'SELECT pg_reload_conf()'
+          for i in $(seq 1 30); do
+            ssl=$(docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -Atc 'SHOW ssl')
+            if [ "$ssl" = on ]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$ssl" = on
+          printf 'SSL_CERT_FILE=%s\n' "$RUNNER_TEMP/server.crt" >> "$GITHUB_ENV"
+      - name: Confirm unchanged upstream fails the TLS regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/upstream" 8e400737781ffbe80eb2bcbfc58f625cc9af582f
+          cp apps/server/internal/infra/postgres_test.go "$RUNNER_TEMP/upstream/apps/server/internal/infra/postgres_test.go"
+          cp apps/server/cmd/bun/postgres_test.go "$RUNNER_TEMP/upstream/apps/server/cmd/bun/postgres_test.go"
+          cd "$RUNNER_TEMP/upstream/apps/server"
+          if go test -count=1 ./internal/infra ./cmd/bun -run PostgresSSLModeTLS > "$GITHUB_WORKSPACE/before.log" 2>&1; then
+            cat "$GITHUB_WORKSPACE/before.log"
+            echo 'The unchanged upstream unexpectedly passed the TLS regressions'
+            exit 1
+          fi
+          cat "$GITHUB_WORKSPACE/before.log"
+          grep -q 'DB_SSLMODE did not reach' "$GITHUB_WORKSPACE/before.log"
+          grep -q -- '--- FAIL: TestProvideSQLDBPostgresSSLModeTLS' "$GITHUB_WORKSPACE/before.log"
+          grep -q -- '--- FAIL: TestConnectToDatabasePostgresSSLModeTLS' "$GITHUB_WORKSPACE/before.log"
+      - name: Run affected packages with the fix and real PostgreSQL TLS
+        working-directory: apps/server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -json -timeout 120s -count=1 ./internal/config ./internal/infra \
+            ./cmd/api ./cmd/producer ./cmd/ingester ./cmd/peekaping ./cmd/bun \
+            > "$GITHUB_WORKSPACE/after.jsonl" 2>&1 || { cat "$GITHUB_WORKSPACE/after.jsonl"; exit 1; }
+          python3 - <<'PY'
+          import collections, json, os
+          from pathlib import Path
+          counts = collections.Counter()
+          tls = []
+          for line in (Path(os.environ["GITHUB_WORKSPACE"]) / "after.jsonl").read_text().splitlines():
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get("Test") and event.get("Action") in ("pass", "fail", "skip"):
+                  counts[event["Action"]] += 1
+                  if "PostgresSSLModeTLS" in event["Test"]:
+                      tls.append({key: event.get(key) for key in ("Package", "Test", "Action")})
+          assert len(tls) == 16 and all(event["Action"] == "pass" for event in tls), tls
+          print(json.dumps({"counts": counts, "tls": tls}, indent=2))
+          PY
+      - name: Vet and check formatting
+        working-directory: apps/server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./internal/... ./cmd/...
+          test -z "$(gofmt -l internal/config/config.go internal/config/postgres_test.go internal/infra/sql.go internal/infra/postgres_test.go cmd/{api,producer,ingester,peekaping}/config.go cmd/{api,producer,ingester,peekaping,bun}/postgres_test.go cmd/bun/main.go)"
+          git diff --check
+      - name: Save verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-sslmode-verification
+          path: |
+            before.log
+            after.jsonl
+      - name: Stop test database
+        if: always()
+        run: docker rm -f peekaping-postgres-258

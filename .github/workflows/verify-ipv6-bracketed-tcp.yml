@@ -1,0 +1,75 @@
+name: Verify bracketed IPv6 TCP compatibility
+
+on:
+  push:
+    branches: [verify/ipv6-bracketed-tcp]
+
+permissions:
+  contents: read
+
+jobs:
+  tcp-dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: apps/server/go.sum
+      - name: Confirm unchanged upstream rejects the bracketed IPv6 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/upstream" 102f0cb1a3e5a52e793d1957cfc1102b945421d9
+          cp apps/server/internal/modules/healthcheck/executor/tcp_test.go "$RUNNER_TEMP/upstream/apps/server/internal/modules/healthcheck/executor/tcp_test.go"
+          cd "$RUNNER_TEMP/upstream/apps/server"
+          if go test -json -count=1 ./internal/modules/healthcheck/executor -run '^TestTCPExecutor_Execute_IPv6Host$' > "$GITHUB_WORKSPACE/before.jsonl" 2>&1; then
+            cat "$GITHUB_WORKSPACE/before.jsonl"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          events = [json.loads(line) for line in (Path(os.environ["GITHUB_WORKSPACE"]) / "before.jsonl").read_text().splitlines() if line.startswith("{")]
+          assert any(e.get("Test") == "TestTCPExecutor_Execute_IPv6Host/[::1]" and e["Action"] == "fail" for e in events), events
+          assert any(e.get("Test") == "TestTCPExecutor_Execute_IPv6Host/::1" and e["Action"] == "pass" for e in events), events
+          assert not any(e["Action"] == "skip" for e in events), events
+          assert any("missing port in address" in e.get("Output", "") for e in events), events
+          print("Unchanged upstream passes bare IPv6 and fails the bracketed IPv6 regression")
+          PY
+      - name: Run TCP and DNS regression tests with the fix
+        working-directory: apps/server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout 90s ./internal/modules/healthcheck/executor \
+            -run '^(TestTCPExecutor_|TestDNSExecutor_)' > "$GITHUB_WORKSPACE/after.jsonl" 2>&1 || { cat "$GITHUB_WORKSPACE/after.jsonl"; exit 1; }
+          python3 - <<'PY'
+          import collections, json, os
+          from pathlib import Path
+          events = [json.loads(line) for line in (Path(os.environ["GITHUB_WORKSPACE"]) / "after.jsonl").read_text().splitlines() if line.startswith("{")]
+          results = [e for e in events if e.get("Test") and e["Action"] in ("pass", "fail", "skip")]
+          assert results and all(e["Action"] == "pass" for e in results), results
+          for name in ("TestTCPExecutor_Execute_IPv6Host/[::1]", "TestTCPExecutor_Execute_IPv6Host/::1", "TestTCPExecutor_Execute_OpenPort", "TestTCPExecutor_Execute_ClosedPort"):
+              assert any(e["Test"] == name and e["Action"] == "pass" for e in results), name
+          print(json.dumps(dict(collections.Counter(e["Action"] for e in results))))
+          PY
+      - name: Vet and check formatting
+        working-directory: apps/server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./internal/modules/healthcheck/...
+          test -z "$(gofmt -l internal/modules/healthcheck/executor/tcp.go internal/modules/healthcheck/executor/tcp_test.go)"
+          git diff --check
+      - name: Save verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipv6-bracketed-tcp-verification
+          path: |
+            before.jsonl
+            after.jsonl

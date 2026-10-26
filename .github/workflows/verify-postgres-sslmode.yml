@@ -37,11 +37,12 @@ jobs:
             -e POSTGRES_USER=peekaping -e POSTGRES_PASSWORD=peekaping-test \
             -e POSTGRES_DB=peekaping -p 127.0.0.1:15432:5432 postgres:17
           for i in $(seq 1 60); do
-            if docker exec peekaping-postgres-258 pg_isready -U peekaping -d peekaping; then
+            if docker exec peekaping-postgres-258 pg_isready -h 127.0.0.1 -U peekaping -d peekaping; then
               break
             fi
             sleep 1
           done
+          docker exec peekaping-postgres-258 pg_isready -h 127.0.0.1 -U peekaping -d peekaping
           docker cp "$RUNNER_TEMP/server.crt" peekaping-postgres-258:/tmp/server.crt
           docker cp "$RUNNER_TEMP/server.key" peekaping-postgres-258:/tmp/server.key
           docker exec -u root peekaping-postgres-258 chown postgres:postgres /tmp/server.crt /tmp/server.key

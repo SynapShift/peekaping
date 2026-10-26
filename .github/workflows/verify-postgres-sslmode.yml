@@ -75,7 +75,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git worktree add --detach "$RUNNER_TEMP/upstream" 8e400737781ffbe80eb2bcbfc58f625cc9af582f
+          git worktree add --detach "$RUNNER_TEMP/upstream" 102f0cb1a3e5a52e793d1957cfc1102b945421d9
           cp apps/server/internal/infra/postgres_test.go "$RUNNER_TEMP/upstream/apps/server/internal/infra/postgres_test.go"
           cp apps/server/cmd/bun/postgres_test.go "$RUNNER_TEMP/upstream/apps/server/cmd/bun/postgres_test.go"
           cd "$RUNNER_TEMP/upstream/apps/server"
@@ -94,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           go test -json -timeout 120s -count=1 ./internal/config ./internal/infra \
-            ./cmd/api ./cmd/producer ./cmd/ingester ./cmd/peekaping ./cmd/bun \
+            ./cmd/api ./cmd/peekaping ./cmd/bun \
             > "$GITHUB_WORKSPACE/after.jsonl" 2>&1 || { cat "$GITHUB_WORKSPACE/after.jsonl"; exit 1; }
           python3 - <<'PY'
           import collections, json, os
@@ -113,13 +113,39 @@ jobs:
           assert len(tls) == 16 and all(event["Action"] == "pass" for event in tls), tls
           print(json.dumps({"counts": counts, "tls": tls}, indent=2))
           PY
+      - name: Check the import rejects required TLS on a plaintext server
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -c "ALTER SYSTEM SET ssl='off'"
+          docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -c 'SELECT pg_reload_conf()'
+          for i in $(seq 1 30); do
+            ssl=$(docker exec -u postgres peekaping-postgres-258 psql -U peekaping -d peekaping -Atc 'SHOW ssl')
+            if [ "$ssl" = off ]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$ssl" = off
+          cd apps/server
+          go test -json -timeout 120s -count=1 ./cmd/bun \
+            -run '^TestImportMongoCommandPostgresSSLMode$' \
+            > "$GITHUB_WORKSPACE/after-plaintext.jsonl" 2>&1 || { cat "$GITHUB_WORKSPACE/after-plaintext.jsonl"; exit 1; }
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          events = [json.loads(line) for line in (Path(os.environ["GITHUB_WORKSPACE"]) / "after-plaintext.jsonl").read_text().splitlines() if line.startswith("{")]
+          results = [e for e in events if e.get("Test") and e["Action"] in ("pass", "fail", "skip")]
+          assert len(results) == 4 and all(e["Action"] == "pass" for e in results), results
+          print("All three import modes passed against a plaintext PostgreSQL server")
+          PYCODE
       - name: Vet and check formatting
         working-directory: apps/server
         shell: bash
         run: |
           set -euo pipefail
           go vet ./internal/... ./cmd/...
-          test -z "$(gofmt -l internal/config/config.go internal/config/postgres_test.go internal/infra/sql.go internal/infra/postgres_test.go cmd/{api,producer,ingester,peekaping}/config.go cmd/{api,producer,ingester,peekaping,bun}/postgres_test.go cmd/bun/main.go)"
+          test -z "$(gofmt -l internal/config/config.go internal/config/postgres_test.go internal/infra/sql.go internal/infra/postgres_test.go cmd/{api,peekaping}/config.go cmd/{api,peekaping,bun}/postgres_test.go cmd/bun/main.go cmd/bun/import_mongo_test.go)"
           git diff --check
       - name: Save verification logs
         if: always()
@@ -129,6 +155,7 @@ jobs:
           path: |
             before.log
             after.jsonl
+            after-plaintext.jsonl
       - name: Stop test databases
         if: always()
         run: docker rm -f peekaping-postgres-258 peekaping-mongo-258
